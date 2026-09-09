@@ -1,18 +1,32 @@
 import operator
 from typing import Annotated, Dict, List, TypedDict
 
+from configs.logger import get_logger
+
+logger = get_logger(__name__)
+
 
 def merge_drafts(left: Dict, right: Dict) -> Dict:
-    """Reducer: lets parallel branches each write their own key into `drafts`
-    without clobbering each other. Without this, two branches finishing at the
-    same time would raise an InvalidUpdateError."""
-    return {**(left or {}), **(right or {})}
+    left = left or {}
+    right = right or {}
+
+    overwritten = [k for k in right if k in left and left[k] != right[k]]
+    if overwritten:
+        logger.debug(
+            "merge_drafts: replacing existing draft(s) for %s "
+            "(expected during the consistency rewrite, not during fan-out)",
+            ", ".join(sorted(overwritten)),
+        )
+
+    merged = {**left, **right}
+    logger.debug(
+        "merge_drafts: %d existing + %d incoming -> %d total (%s)",
+        len(left), len(right), len(merged), ", ".join(sorted(merged)) or "empty",
+    )
+    return merged
 
 
 class PlatformState(TypedDict):
-    """State of ONE platform branch. Lives only inside the per-platform subgraph,
-    so `draft` / `problem` / `attempts` can never be overwritten by a sibling
-    platform running at the same time."""
     brief: str
     platform: str
     draft: str
@@ -21,23 +35,21 @@ class PlatformState(TypedDict):
 
     action_log: Annotated[List[str], operator.add]
 
+    trace_events: Annotated[List[Dict], operator.add]
+
 
 class PlatformOutput(TypedDict):
-    """The ONLY thing a platform branch is allowed to hand back to the parent.
-    Keeps `brief` (and everything else) out of the return value — otherwise all
-    three branches would write `brief` in the same step and LangGraph would
-    raise InvalidUpdateError."""
     drafts: Annotated[Dict, merge_drafts]
 
     action_log: Annotated[List[str], operator.add]
+    trace_events: Annotated[List[Dict], operator.add]
 
 
 class State(TypedDict):
-    """Top-level state. No `queue` / `current` any more — there is no single
-    'platform being worked on' when every platform runs at once."""
     topic: str
     brief: str
 
     drafts: Annotated[Dict, merge_drafts]
 
     action_log: Annotated[List[str], operator.add]
+    trace_events: Annotated[List[Dict], operator.add]

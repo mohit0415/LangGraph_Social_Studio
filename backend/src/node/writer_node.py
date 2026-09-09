@@ -1,24 +1,74 @@
-from backend.src.agent import write_post
-from backend.src.schemas.state import PlatformState
+import time
+
+from configs.logger import get_logger, preview
+from src.agent import write_post
+from src.schemas.state import PlatformState
+from src.utils.trace import event
+
+logger = get_logger(__name__)
 
 
 def write_node(state: PlatformState) -> dict:
-    """Writes a fresh draft, or revises the last one if self_check found a problem.
-
-    Only change: reads `platform` (branch-local) instead of `current` (global).
-    """
     platform = state["platform"]
     attempt = state["attempts"] + 1
+    problem = state["problem"]
+    started = time.perf_counter()
 
-    if state["problem"]:
-        print(f"[{platform}] self-correcting (attempt {attempt})")
-        draft = write_post(
-            platform, state["brief"],
-            fix=state["problem"], old_draft=state["draft"],
+    if problem:
+        logger.info(
+            "[%s] REVISE attempt %d | acting on critique: %s",
+            platform, attempt, preview(problem, limit=200),
         )
-        action = f"[{platform}] revised (attempt {attempt}): {state['problem']}"
+        logger.debug(
+            "[%s] previous draft (%d chars): %s",
+            platform, len(state["draft"]), preview(state["draft"]),
+        )
+        try:
+            draft = write_post(
+                platform, state["brief"],
+                fix=problem, old_draft=state["draft"],
+            )
+        except Exception:
+            logger.exception(
+                "[%s] FAILED revising on attempt %d (fix=%r)",
+                platform, attempt, preview(problem, limit=80),
+            )
+            raise
+
+        action = (
+            f"[{platform}] revised (attempt {attempt}) to fix: {problem} "
+            f"-> {len(draft)} chars"
+        )
+        status = "revised"
+        detail = f"Rewrote the draft to fix: {problem}"
     else:
-        print(f"[{platform}] writing...")
-        draft = write_post(platform, state["brief"])
-        action = f"[{platform}] wrote first draft"
-    return {"draft": draft, "attempts": attempt, "action_log": [action]}
+        logger.info("[%s] WRITE attempt %d | first draft from the brief", platform, attempt)
+        try:
+            draft = write_post(platform, state["brief"])
+        except Exception:
+            logger.exception("[%s] FAILED writing first draft", platform)
+            raise
+
+        action = f"[{platform}] wrote first draft ({len(draft)} chars)"
+        status = "drafted"
+        detail = f"Wrote the first {len(draft)}-character draft from the brief."
+
+    elapsed_ms = round((time.perf_counter() - started) * 1000)
+
+    logger.info(
+        "[%s] draft ready | attempt=%d chars=%d elapsed=%d ms",
+        platform, attempt, len(draft), elapsed_ms,
+    )
+    logger.debug("[%s] draft content: %s", platform, preview(draft, limit=300))
+
+    return {
+        "draft": draft,
+        "attempts": attempt,
+        "action_log": [action],
+        "trace_events": [
+            event(
+                "write", platform, status,
+                detail=detail, attempt=attempt, started=started,
+            )
+        ],
+    }
