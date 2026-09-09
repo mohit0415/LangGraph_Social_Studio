@@ -2,6 +2,7 @@ import React from 'react'
 import { useDispatch } from 'react-redux'
 import { useNavigate } from 'react-router-dom'
 import { AUTH_LOGOUT } from '../store/authReducer'
+import { logoutStudio } from '../utils/studio_api'
 import TopBar from '../components/TopBar'
 import SourceInput from './SourceInput'
 import Results from './Results'
@@ -12,7 +13,10 @@ const Studio = () => {
   const dispatch = useDispatch()
   const navigate = useNavigate()
 
-  const handleSignOut = () => {
+  const handleSignOut = async () => {
+    // Ask the backend to drop the session first, so the Azure key it is holding
+    // is discarded rather than left to idle out.
+    await logoutStudio()
     dispatch({ type: AUTH_LOGOUT })
     navigate('/', { replace: true })
   }

@@ -14,10 +14,24 @@ if str(BACKEND_ROOT) not in sys.path:
 TEST_DB_DIR = tempfile.mkdtemp(prefix="studio-tests-")
 os.environ["STUDIO_DB_PATH"] = str(Path(TEST_DB_DIR) / "test_studio.db")
 os.environ.setdefault("LOG_LEVEL", "WARNING")
-os.environ.setdefault("AZURE_OPENAI_API_KEY", "test-key")
-os.environ.setdefault("AZURE_OPENAI_ENDPOINT", "https://test.openai.azure.com/")
-os.environ.setdefault("AZURE_OPENAI_API_VERSION", "2024-02-01")
-os.environ.setdefault("AZURE_OPENAI_DEPLOYMENT", "test-deployment")
+
+# Keep the suite off the network. Set before main is imported, so the .env that
+# load_dotenv reads later cannot switch tracing back on and make every test wait
+# on Langfuse.
+os.environ.setdefault("LANGFUSE_PUBLIC_KEY", "")
+os.environ.setdefault("LANGFUSE_SECRET_KEY", "")
+
+# No AZURE_OPENAI_* here on purpose. The backend no longer reads credentials
+# from the environment, so a test that needs them builds an AzureCredentials
+# and binds it explicitly — see the `credentials` and `client` fixtures below.
+for leftover in (
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_API_VERSION",
+    "AZURE_OPENAI_DEPLOYMENT",
+    "AZURE_OPENAI_DEPLOYMENT_SIMPLE",
+):
+    os.environ.pop(leftover, None)
 
 
 def pytest_collection_modifyitems(config, items):
@@ -105,6 +119,31 @@ def studio(monkeypatch):
 
 
 @pytest.fixture
+def credentials():
+    """A credential set shaped like a real one, pointed at nothing."""
+    from configs.credentials import AzureCredentials
+
+    return AzureCredentials.build(
+        endpoint="https://test.openai.azure.com",
+        api_key="test-key",
+        deployment="test-deployment",
+        api_version="2024-02-01",
+    )
+
+
+@pytest.fixture
+def bound_credentials(credentials):
+    """Credentials bound to the context, as a request would bind them."""
+    from configs.credentials import use_credentials
+    from configs.llms import clear_model_cache
+
+    clear_model_cache()
+    with use_credentials(credentials) as bound:
+        yield bound
+    clear_model_cache()
+
+
+@pytest.fixture
 def memory_conn():
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -127,8 +166,42 @@ def api():
 
 
 @pytest.fixture(scope="session")
-def client(api):
+def raw_client(api):
+    """A client that sends no session header — guarded routes should 401.
+
+    Deliberately not entered as a context manager: the app's lifespan is already
+    running for the signed-in `client`, and firing shutdown twice would tear down
+    the Langfuse manager underneath it.
+    """
     from fastapi.testclient import TestClient
 
+    return TestClient(api.app)
+
+
+@pytest.fixture(scope="session")
+def client(api):
+    """A signed-in client.
+
+    The session is created directly on the store rather than through
+    /auth/login, so the suite exercises the real dependency without needing an
+    Azure endpoint to probe against.
+    """
+    from fastapi.testclient import TestClient
+
+    from configs.credentials import AzureCredentials
+    from src.routes.auth import SESSION_HEADER
+
+    session = api.session_store.create(
+        AzureCredentials.build(
+            endpoint="https://test.openai.azure.com",
+            api_key="test-key",
+            deployment="test-deployment",
+            api_version="2024-02-01",
+        )
+    )
+
     with TestClient(api.app) as test_client:
+        test_client.headers[SESSION_HEADER] = session.session_id
         yield test_client
+
+    api.session_store.delete(session.session_id)

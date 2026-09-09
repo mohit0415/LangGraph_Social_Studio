@@ -2,14 +2,18 @@ import time
 import uuid
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
+from configs.credentials import AzureCredentials, MissingCredentialsError
 from configs.database import connect, db_path
 from configs.logger import get_logger, preview
 from src.agent import RULES, route_message, write_post
 from src.graphs.graph import build_checkpointer, build_graph
 from src.models.models import SocialInput
+from src.routes.auth import require_credentials, session_store
+from src.routes.auth import router as auth_router
 from src.store.thread_store import ThreadStore
 from src.utils.trace import event
 from src.callbacks.langfuse_callback import build_run_config, get_langfuse_manager
@@ -30,6 +34,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth_router)
+
 checkpointer = build_checkpointer()
 workflow_graph = build_graph(checkpointer)
 print(workflow_graph.get_graph().draw_mermaid())
@@ -39,11 +45,24 @@ threads_store = ThreadStore(connect("threads"))
 langfuse_manager = get_langfuse_manager()
 
 logger.info(
-    "studio API ready | %d platforms configured: %s | database=%s",
+    "studio API ready | %d platforms configured: %s | database=%s | Azure "
+    "credentials come from /auth/login, never from the environment",
     len(RULES),
     ", ".join(f"{name} (<={rule['max_chars']} chars)" for name, rule in RULES.items()),
     db_path(),
 )
+
+
+@app.exception_handler(MissingCredentialsError)
+async def _no_credentials(request: Request, exc: MissingCredentialsError) -> JSONResponse:
+    """A model was requested with nothing bound to the request context.
+
+    Reaching this means a route is missing `require_credentials`, so answer 401
+    rather than a 500 — the browser's 401 handling sends the user back to the
+    login page, which is where the credentials come from.
+    """
+    logger.error("%s %s reached the model layer unauthenticated", request.method, request.url.path)
+    return JSONResponse(status_code=401, content={"detail": str(exc)})
 
 
 def _thread_payload(thread_id: str, state: dict, **extra) -> dict:
@@ -270,10 +289,14 @@ def _shutdown_langfuse() -> None:
 
 
 @app.post("/ask")
-async def social_query(ques: SocialInput):
+async def social_query(
+    ques: SocialInput,
+    credentials: AzureCredentials = Depends(require_credentials),
+):
     logger.info(
-        "POST /ask | thread=%s | query (%d chars): %s",
+        "POST /ask | thread=%s | creds=%s deployment=%s | query (%d chars): %s",
         ques.thread_id or "(none -> new run)",
+        credentials.fingerprint, credentials.deployment,
         len(ques.query or ""), preview(ques.query, limit=150),
     )
 
@@ -313,20 +336,26 @@ async def social_query(ques: SocialInput):
 
 
 @app.get("/threads")
-def list_threads():
+def list_threads(credentials: AzureCredentials = Depends(require_credentials)):
     logger.info("GET /threads")
     return {"threads": threads_store.list_all()}
 
 
 @app.get("/threads/{thread_id}")
-def get_thread(thread_id: str):
+def get_thread(
+    thread_id: str,
+    credentials: AzureCredentials = Depends(require_credentials),
+):
     logger.info("GET /threads/%s", thread_id)
     state = _load_state(thread_id)
     return _thread_payload(thread_id, state, action="load")
 
 
 @app.delete("/threads/{thread_id}")
-def delete_thread(thread_id: str):
+def delete_thread(
+    thread_id: str,
+    credentials: AzureCredentials = Depends(require_credentials),
+):
     logger.info("DELETE /threads/%s", thread_id)
 
     removed_from_index = threads_store.delete(thread_id)
@@ -361,7 +390,12 @@ def platforms():
 @app.get("/health")
 def health():
     logger.debug("GET /health -> ok")
-    return {"status": "ok", "database": str(db_path())}
+    return {
+        "status": "ok",
+        "database": str(db_path()),
+        "credentials": "per-session (supplied at /auth/login)",
+        "active_sessions": len(session_store),
+    }
 
 
 if __name__ == "__main__":

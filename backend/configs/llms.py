@@ -1,17 +1,28 @@
-import os
-import re
-from functools import lru_cache
+"""Model selection and construction.
 
-from dotenv import load_dotenv
+Two things this module does NOT do, on purpose:
+
+1. It reads no credentials from the environment. There is no ``os.getenv`` for
+   ``AZURE_OPENAI_API_KEY`` or anything like it. Every client is built from the
+   credentials of the signed-in user, taken from ``configs.credentials``.
+2. It has no local/Ollama tier. Both tiers are Azure; the cheap tier simply
+   points at a second deployment when the user supplied one at sign-in.
+
+Everything above that — the keyword heuristic, the pinned tasks, the prompt
+cache accounting — is unchanged.
+"""
+
+import re
+import threading
+
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
-from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from langchain_openai import AzureChatOpenAI
 
+from configs.credentials import AzureCredentials, current_credentials
 from configs.logger import get_logger
 
 logger = get_logger(__name__)
-
-load_dotenv()
 
 
 COMPLEX_KEYWORDS = [
@@ -126,8 +137,8 @@ class CacheUsageHandler(BaseCallbackHandler):
 
         if cached is None:
             logger.debug(
-                "prompt cache n/a  model=%s | %s prompt tokens — this provider does "
-                "not report cached_tokens (expected on the Ollama tier)",
+                "prompt cache n/a  model=%s | %s prompt tokens — this response did "
+                "not report cached_tokens",
                 model, prompt_tokens or "?",
             )
             return
@@ -177,104 +188,111 @@ def supports_prompt_cache(llm) -> bool:
     return isinstance(llm, AzureChatOpenAI)
 
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+def build_azure_client(
+    credentials: AzureCredentials,
+    deployment: str,
+    temperature: float = 0.7,
+    **overrides,
+) -> AzureChatOpenAI:
+    """Build a client from an explicit credential set.
 
-
-@lru_cache(maxsize=1)
-def _ollama_is_up() -> bool:
-    import urllib.error
-    import urllib.request
-
-    url = OLLAMA_BASE_URL.rstrip("/") + "/models"
-    try:
-        with urllib.request.urlopen(url, timeout=2):
-            logger.info("Ollama reachable at %s (model=%s)", OLLAMA_BASE_URL, OLLAMA_MODEL)
-            return True
-    except urllib.error.HTTPError:
-        logger.info("Ollama responding at %s", OLLAMA_BASE_URL)
-        return True
-    except Exception as exc:
-        logger.warning(
-            "Ollama not reachable at %s (%s). Simple tier falls back to Azure. "
-            "Start it with: ollama serve   (and: ollama pull %s)",
-            OLLAMA_BASE_URL, exc, OLLAMA_MODEL,
-        )
-        return False
-
-
-def _build_azure(deployment: str, temperature: float) -> AzureChatOpenAI:
-    config = {
-        "azure_endpoint": os.getenv("AZURE_OPENAI_ENDPOINT"),
-        "api_key": os.getenv("AZURE_OPENAI_API_KEY"),
-        "api_version": os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
-    }
-
-    for key, name in [
-        ("api_key", "AZURE_OPENAI_API_KEY"),
-        ("azure_endpoint", "AZURE_OPENAI_ENDPOINT"),
-        ("api_version", "AZURE_OPENAI_API_VERSION"),
-    ]:
-        if not config[key]:
-            logger.error("Missing %s", name)
-            raise ValueError(f"{name} not found in environment variables")
-
+    Kept separate from ``get_model`` so the login route can construct a throwaway
+    client to probe the credentials before it opens a session, without touching
+    the cache or the request context.
+    """
     if not deployment:
-        raise ValueError("AZURE_OPENAI_DEPLOYMENT not found in environment variables")
+        raise ValueError("A deployment name is required to build an Azure client.")
 
-    return AzureChatOpenAI(
-        api_key=config["api_key"],
-        api_version=config["api_version"],
-        azure_endpoint=config["azure_endpoint"],
-        azure_deployment=deployment,
-        temperature=temperature,
-        model_kwargs={
-            "prompt_cache_key":"langchain-prompt-caching"
-        },
-        callbacks=[CACHE_LOGGER],
-    )
+    settings = {
+        "api_key": credentials.api_key,
+        "api_version": credentials.api_version,
+        "azure_endpoint": credentials.endpoint,
+        "azure_deployment": deployment,
+        "temperature": temperature,
+        "model_kwargs": {"prompt_cache_key": "langchain-prompt-caching"},
+        "callbacks": [CACHE_LOGGER],
+    }
+    settings.update(overrides)
+
+    return AzureChatOpenAI(**settings)
 
 
-@lru_cache(maxsize=8)
-def get_model(tier: str = "complex", temperature: float = 0.7):
+_MODEL_CACHE: dict[tuple[str, str, float], AzureChatOpenAI] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def get_model(tier: str = "complex", temperature: float = 0.7) -> AzureChatOpenAI:
+    """The client for this tier, built from the current request's credentials.
+
+    Clients are cached per (credentials, deployment, temperature) rather than per
+    tier alone, so two users signed in with different Azure resources never share
+    a client — the old single-key cache would have handed the second user the
+    first user's connection.
+    """
     if tier not in TIERS:
+        logger.debug("unknown tier %r — treating it as complex", tier)
         tier = "complex"
 
-    if tier == "simple" and _ollama_is_up():
-        logger.info("built Ollama client: %s (tier=simple, cached from here on)", OLLAMA_MODEL)
-        return ChatOpenAI(
-            model=OLLAMA_MODEL,
-            base_url=OLLAMA_BASE_URL,
-            api_key="ollama",
-            temperature=temperature,
-            callbacks=[CACHE_LOGGER],
-        )
+    credentials = current_credentials()
+    deployment = credentials.deployment_for(tier)
+    key = (credentials.fingerprint, deployment, temperature)
 
-    main = os.getenv("AZURE_OPENAI_DEPLOYMENT")
-    cheap = os.getenv("AZURE_OPENAI_DEPLOYMENT_SIMPLE")
-    deployment = cheap if (tier == "simple" and cheap) else main
+    with _CACHE_LOCK:
+        client = _MODEL_CACHE.get(key)
+        if client is not None:
+            return client
 
-    logger.info("built Azure client: %s (tier=%s, cached from here on)", deployment, tier)
-    return _build_azure(deployment, temperature)
+        client = build_azure_client(credentials, deployment, temperature)
+        _MODEL_CACHE[key] = client
+
+    logger.info(
+        "built Azure client: %s (tier=%s, creds=%s, cached from here on)",
+        deployment, tier, credentials.fingerprint,
+    )
+    return client
 
 
-def load_config(temperature: float = 0.7):
+def forget_models(fingerprint: str) -> int:
+    """Drop every cached client built from one credential set.
+
+    Called on logout so an API key does not outlive the session that supplied it.
+    """
+    with _CACHE_LOCK:
+        stale = [key for key in _MODEL_CACHE if key[0] == fingerprint]
+        for key in stale:
+            _MODEL_CACHE.pop(key, None)
+
+    if stale:
+        logger.info("dropped %d cached client(s) for creds=%s", len(stale), fingerprint)
+    return len(stale)
+
+
+def clear_model_cache() -> None:
+    with _CACHE_LOCK:
+        _MODEL_CACHE.clear()
+
+
+def load_config(temperature: float = 0.7) -> AzureChatOpenAI:
     return get_model("complex", temperature)
 
 
 def describe_target(tier: str) -> str:
-    if tier == "simple" and _ollama_is_up():
-        return f"ollama:{OLLAMA_MODEL}"
+    """Human-readable name of what this tier will call, for the routing log."""
+    try:
+        credentials = current_credentials()
+    except Exception:
+        return "azure:(no credentials on this request)"
 
-    main = os.getenv("AZURE_OPENAI_DEPLOYMENT")
-    cheap = os.getenv("AZURE_OPENAI_DEPLOYMENT_SIMPLE")
-    deployment = cheap if (tier == "simple" and cheap) else main
+    deployment = credentials.deployment_for(tier)
+    shared = (
+        " (shared with complex)"
+        if tier == "simple" and not credentials.simple_deployment
+        else ""
+    )
+    return f"azure:{deployment}{shared}"
 
-    suffix = " (ollama down)" if tier == "simple" else ""
-    return f"azure:{deployment}{suffix}"
 
-
-def model_for(task: str, text: str = "", temperature: float = 0.7):
+def model_for(task: str, text: str = "", temperature: float = 0.7) -> AzureChatOpenAI:
     tier, reason = resolve_tier(task, text)
     logger.info(
         "route task=%-11s tier=%-7s -> %s  [%s]",

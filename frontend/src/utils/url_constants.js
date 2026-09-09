@@ -6,3 +6,7 @@ export const healthURL = baseURL + '/health'
 
 export const threadsURL = baseURL + '/threads'
 export const threadURL = (id) => `${baseURL}/threads/${encodeURIComponent(id)}`
+
+export const loginURL = baseURL + '/auth/login'
+export const logoutURL = baseURL + '/auth/logout'
+export const sessionURL = baseURL + '/auth/session'

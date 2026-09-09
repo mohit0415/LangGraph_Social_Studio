@@ -112,14 +112,35 @@ Your system must support:
 
 ------------------------------------------------------------------------
 
-## 🔐 Environment Variables
+## 🔐 Credentials
+
+LLM credentials do **not** come from `.env`. They are entered on the login page,
+verified against Azure with a one-token probe, and held in an in-memory session
+for as long as the user is signed in — never written to disk, never returned to
+the browser, and gone when the process restarts.
+
+| Field (login page) | Purpose |
+|--------------------|---------|
+| Endpoint | `https://<resource>.openai.azure.com` |
+| API key | Azure OpenAI key — posted once, kept in memory only |
+| Deployment | Deployment used by the complex tier |
+| API version | Azure API version (defaults to `2024-12-01-preview`) |
+| Simple-tier deployment | *Optional* — cheaper deployment for straightforward copy; blank means both tiers share one deployment |
+
+`POST /auth/login` returns a session id. Every guarded request (`/ask`,
+`/threads`) carries it in the `X-Session-Id` header; `require_credentials` turns
+it back into credentials bound to the request context, which is how they reach
+`configs/llms.py` inside the graph — including the platform branches running in
+parallel worker threads. `POST /auth/logout` drops the session and the cached
+clients built from it.
+
+### Environment Variables
 
 | Variable | Purpose |
 |-----------|---------|
-| OPENAI_API_KEY | LLM authentication |
-| ANTHROPIC_API_KEY | Optional LLM provider |
-| MODEL_NAME | Selected LLM |
-| DEBUG_MODE | Workflow debugging flag |
+| LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST | Optional tracing; tracing is off when unset |
+| STUDIO_DB_PATH | Override the SQLite location |
+| LOG_LEVEL | Logging verbosity |
 
 ------------------------------------------------------------------------
 
