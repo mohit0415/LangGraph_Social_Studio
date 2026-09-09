@@ -1,16 +1,16 @@
-from backend.src.utils.prompts import WRITER_SYSTEM ,REVISE_TASK,WRITE_TASK,RULES
+from configs.logger import get_logger
+from src.agent import write_post as _write_post
 
-def write_post(platform,brief,fix = "",old_draft=""):
-    rules = RULES[platform]
-    system =  WRITER_SYSTEM.format(
-        platform = platform,
-        style = rules['style'],
-        old_draft=old_draft,
-        fix = fix
+logger = get_logger(__name__)
+
+__all__ = ["write_post"]
+
+
+def write_post(platform: str, brief: str, fix: str = "", old_draft: str = "") -> str:
+    logger.warning(
+        "DEPRECATED: src.utils.write_post.write_post was called for platform=%r. "
+        "Import `from src.agent import write_post` instead — this shim only "
+        "delegates and will be removed.",
+        platform,
     )
-
-    if fix:
-        user = REVISE_TASK.format(brief=brief, old_draft=old_draft, fix=fix)
-    else:
-        user = WRITE_TASK.format(brief=brief)
-    return system
+    return _write_post(platform, brief, fix=fix, old_draft=old_draft)
